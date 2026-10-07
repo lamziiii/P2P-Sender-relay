@@ -1,0 +1,14 @@
+services:
+  p2p-relay:
+    image: ghcr.io/lamziiii/p2p-sender-relay:latest
+    container_name: p2p-relay
+    restart: unless-stopped
+    environment:
+      # Only clients configured with this token may use the relay.
+      # Generate one with: openssl rand -hex 24
+      RELAY_TOKEN: ${RELAY_TOKEN:?set RELAY_TOKEN in .env}
+      # Optional per-client limit, in KB/s.
+      # RATE_LIMIT_KBPS: "20000"
+    # Plain HTTP: publish it only to the reverse proxy, never to the Internet.
+    ports:
+      - "127.0.0.1:3340:3340"

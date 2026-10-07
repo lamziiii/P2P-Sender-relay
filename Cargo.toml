@@ -1,0 +1,35 @@
+[package]
+name = "p2p-sender-relay"
+version = "1.0.0"
+description = "Relay and address directory for P2P Share, served over plain HTTP behind a reverse proxy"
+authors = ["lamzii"]
+license = "MIT"
+edition = "2024"
+rust-version = "1.89"
+
+[[bin]]
+name = "p2p-relay"
+path = "src/main.rs"
+
+[dependencies]
+iroh-relay = { version = "1.3", features = ["server"] }
+iroh-dns = "1.3"
+iroh-base = "1.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "io-util"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+iroh = "1.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
