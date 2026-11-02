@@ -97,9 +97,18 @@ Check it from outside: `curl https://files.example.com/healthz` should answer `{
 
 ## In P2P Share
 
-Settings → **Relais personnel**: enter `https://files.example.com` and the token, then *Appliquer et redémarrer*. The status line shows whether the app is connected to your relay.
+Settings → Réseau → **Relais personnel**: enter `https://files.example.com` and the token, then *Appliquer et redémarrer*. The status line shows whether the app is connected to your relay.
 
-Everyone who wants to reach you from a blocking network must use the same relay and token: your relay becomes your only home relay, and friends reach you through it. Your address is still published to iroh's public directory too.
+Since P2P Share 3.4.5:
+
+- **Your relay comes first.** It is the app's home relay whenever it answers, so friends who set the same relay exchange with you through it when no direct path works. That is usually faster than iroh's public relays, which everyone using iroh shares; set `RATE_LIMIT_KBPS` if you want to cap what your server carries.
+- **Friends who do not use it are still reached** on their own relays, wherever the network lets the app reach iroh's public relays.
+- **While your relay does not answer**, the app falls back to the public relays, then checks `/ping` every minute and comes back to yours once it answers.
+- **Your address** is published to your relay's directory and to iroh's public one.
+
+On a network that blocks iroh's public relays (eduroam behind a FortiGate…), everyone who wants to reach you must use the same relay and token.
+
+Before 3.4.5, the relay replaced the public relays entirely: the app had no fallback when it did not answer.
 
 ## Build
 
