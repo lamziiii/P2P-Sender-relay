@@ -6,12 +6,17 @@
 //!   directly and lets them set up direct connections;
 //! - `/ping`, `/generate_204`: the probes iroh uses to pick its relay;
 //! - `/pkarr/<id>`: the address directory where endpoints publish their
-//!   signed address and look up their friends';
+//!   signed address and look up their friends'; it stands in for iroh's
+//!   public directory too (see `upstream.rs`);
+//! - `/tunnel`: a way to iroh's public relays for clients on networks that
+//!   block them (see `tunnel.rs`);
 //! - `/healthz`: health check.
 //!
 //! Settings come from environment variables, see the README.
 
 mod pkarr;
+mod tunnel;
+mod upstream;
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -41,9 +46,15 @@ use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::pkarr::{PutError, Store};
+use crate::tunnel::{Allowed, Tunnels};
+use crate::upstream::Upstream;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:3340";
 const DEFAULT_MAX_RECORDS: usize = 100_000;
+/// iroh's public relays (`*.relay.n0.iroh.link`).
+const DEFAULT_TUNNEL_HOSTS: &str = "relay.n0.iroh.link";
+const DEFAULT_MAX_TUNNELS: usize = 256;
+const DEFAULT_UPSTREAM_PKARR: &str = "https://dns.iroh.link/pkarr";
 /// Same as iroh's own relays.
 const KEY_CACHE_CAPACITY: usize = 1024 * 1024;
 /// A signed packet is at most 1104 bytes.
@@ -55,6 +66,9 @@ struct Config {
     token: Option<String>,
     rate_limit: Option<ClientRateLimit>,
     max_records: usize,
+    tunnel_hosts: Allowed,
+    max_tunnels: usize,
+    upstream: Option<Upstream>,
 }
 
 impl Config {
@@ -79,11 +93,24 @@ impl Config {
             Some(v) => v.parse().map_err(|e| format!("MAX_RECORDS: {e}"))?,
             None => DEFAULT_MAX_RECORDS,
         };
+        // Set but empty: turned off.
+        let set_or = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.into());
+        let tunnel_hosts = Allowed::parse(&set_or("TUNNEL_HOSTS", DEFAULT_TUNNEL_HOSTS))
+            .map_err(|e| format!("TUNNEL_HOSTS: {e}"))?;
+        let max_tunnels = match var("MAX_TUNNELS") {
+            Some(v) => v.parse().map_err(|e| format!("MAX_TUNNELS: {e}"))?,
+            None => DEFAULT_MAX_TUNNELS,
+        };
+        let upstream = Upstream::parse(&set_or("UPSTREAM_PKARR", DEFAULT_UPSTREAM_PKARR))
+            .map_err(|e| format!("UPSTREAM_PKARR: {e}"))?;
         Ok(Config {
             listen,
             token: var("RELAY_TOKEN"),
             rate_limit,
             max_records,
+            tunnel_hosts,
+            max_tunnels,
+            upstream,
         })
     }
 }
@@ -118,7 +145,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[derive(Clone)]
 struct Router {
     relay: RelayServiceWithNotify,
-    store: Arc<Store>,
+    shared: Arc<Shared>,
+}
+
+/// What every connection uses.
+struct Shared {
+    store: Store,
+    upstream: Option<Upstream>,
+    tunnels: Arc<Tunnels>,
+    token: Option<String>,
 }
 
 type BoxFuture = Pin<Box<dyn Future<Output = Result<Response<BytesBody>, HyperError>> + Send>>;
@@ -132,8 +167,13 @@ impl Service<Request<Incoming>> for Router {
         if req.uri().path() == "/relay" {
             return Box::pin(self.relay.call(req));
         }
-        let store = self.store.clone();
-        Box::pin(async move { Ok(handle(&store, req).await) })
+        let shared = self.shared.clone();
+        if req.uri().path() == "/tunnel" {
+            return Box::pin(async move {
+                Ok(tunnel::open(&shared.tunnels, shared.token.as_deref(), req).await)
+            });
+        }
+        Box::pin(async move { Ok(handle(&shared, req).await) })
     }
 }
 
@@ -151,7 +191,8 @@ fn reply(status: StatusCode, body: BytesBody) -> Response<BytesBody> {
     res
 }
 
-async fn handle(store: &Store, req: Request<Incoming>) -> Response<BytesBody> {
+async fn handle(shared: &Arc<Shared>, req: Request<Incoming>) -> Response<BytesBody> {
+    let store = &shared.store;
     let path = req.uri().path().to_owned();
     match (req.method(), path.as_str()) {
         (&Method::GET, "/" | "/index.html") => reply(
@@ -184,7 +225,7 @@ async fn handle(store: &Store, req: Request<Incoming>) -> Response<BytesBody> {
         (method, p) if p.starts_with("/pkarr/") => {
             let id = &p["/pkarr/".len()..];
             match *method {
-                Method::GET => match store.get(id) {
+                Method::GET => match lookup(shared, id).await {
                     Some(payload) => {
                         let mut res = reply(StatusCode::OK, full(payload));
                         res.headers_mut().insert(
@@ -201,7 +242,19 @@ async fn handle(store: &Store, req: Request<Incoming>) -> Response<BytesBody> {
                         Err(_) => return reply(StatusCode::PAYLOAD_TOO_LARGE, empty()),
                     };
                     match store.put(id, &body) {
-                        Ok(()) => reply(StatusCode::NO_CONTENT, empty()),
+                        Ok(()) => {
+                            // Also where friends without this relay look.
+                            if shared.upstream.is_some() {
+                                let shared = shared.clone();
+                                let id = id.to_string();
+                                tokio::spawn(async move {
+                                    if let Some(up) = &shared.upstream {
+                                        up.put(&id, body).await;
+                                    }
+                                });
+                            }
+                            reply(StatusCode::NO_CONTENT, empty())
+                        }
                         Err(PutError::Invalid) => reply(StatusCode::BAD_REQUEST, empty()),
                         Err(PutError::Outdated) => reply(StatusCode::CONFLICT, empty()),
                         Err(PutError::Full) => {
@@ -215,6 +268,15 @@ async fn handle(store: &Store, req: Request<Incoming>) -> Response<BytesBody> {
         }
         _ => reply(StatusCode::NOT_FOUND, full("Not Found")),
     }
+}
+
+/// The record of `id`: ours, or else the upstream directory's, checked.
+async fn lookup(shared: &Shared, id: &str) -> Option<Vec<u8>> {
+    if let Some(payload) = shared.store.get(id) {
+        return Some(payload);
+    }
+    let payload = shared.upstream.as_ref()?.get(id).await?;
+    pkarr::verify(id, &payload).then(|| payload.to_vec())
 }
 
 /// Captive-portal check: echo iroh's challenge.
@@ -237,11 +299,11 @@ fn generate_204(req: &Request<Incoming>) -> Response<BytesBody> {
     res
 }
 
-async fn serve(stream: TcpStream, relay: RelayService, store: Arc<Store>) {
+async fn serve(stream: TcpStream, relay: RelayService, shared: Arc<Shared>) {
     let _ = stream.set_nodelay(true);
     let router = Router {
         relay: RelayServiceWithNotify::new(relay, Arc::new(Notify::new())),
-        store,
+        shared,
     };
     let conn = http1::Builder::new()
         .timer(TokioTimer::new())
@@ -314,7 +376,15 @@ async fn main() {
         Arc::new(TokenAccess(config.token.clone())),
         Arc::new(Metrics::default()),
     );
-    let store = Arc::new(Store::new(config.max_records));
+    let shared = Arc::new(Shared {
+        store: Store::new(config.max_records),
+        upstream: config.upstream,
+        tunnels: Arc::new(Tunnels {
+            allowed: config.tunnel_hosts,
+            slots: tokio::sync::Semaphore::new(config.max_tunnels),
+        }),
+        token: config.token.clone(),
+    });
 
     let listener = match TcpListener::bind(config.listen).await {
         Ok(l) => l,
@@ -333,14 +403,19 @@ async fn main() {
             None => "none".into(),
         },
     );
+    info!(
+        "tunnel to iroh's relays {}, upstream directory {}",
+        if shared.tunnels.allowed.is_empty() { "off" } else { "on" },
+        shared.upstream.as_ref().map_or("off".into(), |u| u.describe()),
+    );
 
     let pruner = {
-        let store = store.clone();
+        let shared = shared.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(600));
             loop {
                 tick.tick().await;
-                store.prune();
+                shared.store.prune();
             }
         })
     };
@@ -351,7 +426,7 @@ async fn main() {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    tokio::spawn(serve(stream, relay.clone(), store.clone()));
+                    tokio::spawn(serve(stream, relay.clone(), shared.clone()));
                 }
                 Err(e) => {
                     warn!("accept failed: {e}");

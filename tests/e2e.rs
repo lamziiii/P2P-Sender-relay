@@ -1,5 +1,6 @@
 //! Two iroh endpoints that can only talk through the relay (no UDP) and only
-//! know each other's ID find each other through the relay's address directory.
+//! know each other's ID find each other through the relay's address directory;
+//! and the tunnel passes bytes to an allowed destination only, with the token.
 
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -19,13 +20,25 @@ impl Drop for Relay {
     }
 }
 
-fn start_relay(port: u16) -> Relay {
+fn start_relay(port: u16, tunnel_hosts: &str) -> Relay {
     let child = Command::new(env!("CARGO_BIN_EXE_p2p-relay"))
         .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
         .env("RELAY_TOKEN", TOKEN)
+        // Nothing sent to iroh's public directory from the tests.
+        .env("UPSTREAM_PKARR", "")
+        .env("TUNNEL_HOSTS", tunnel_hosts)
         .spawn()
         .expect("start relay");
     Relay(child)
+}
+
+async fn wait_listening(port: u16) {
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn endpoint(base: &str, token: Option<&str>) -> Endpoint {
@@ -55,13 +68,8 @@ async fn relayed_connection_found_through_directory() {
         Ok(url) => (url, None),
         Err(_) => {
             let port = 43_000 + (std::process::id() % 2000) as u16;
-            let relay = start_relay(port);
-            for _ in 0..50 {
-                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            let relay = start_relay(port, "");
+            wait_listening(port).await;
             (format!("http://127.0.0.1:{port}/"), Some(relay))
         }
     };
@@ -113,5 +121,66 @@ async fn relayed_connection_found_through_directory() {
             .await
             .is_err(),
         "a client without the token must not get online"
+    );
+}
+
+/// A WebSocket to the tunnel, or the HTTP status that refused it.
+async fn open_tunnel(
+    port: u16,
+    to: &str,
+    token: Option<&str>,
+) -> Result<tokio_websockets::WebSocketStream<tokio_websockets::MaybeTlsStream<tokio::net::TcpStream>>, String> {
+    let uri: hyper::Uri = format!("ws://127.0.0.1:{port}/tunnel?to={to}").parse().unwrap();
+    let mut builder = tokio_websockets::ClientBuilder::from_uri(uri);
+    if let Some(t) = token {
+        builder = builder
+            .add_header(
+                hyper::header::AUTHORIZATION,
+                format!("Bearer {t}").parse().unwrap(),
+            )
+            .unwrap();
+    }
+    builder.connect().await.map(|(ws, _)| ws).map_err(|e| e.to_string())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tunnel_passes_bytes_to_allowed_destinations_only() {
+    use n0_future::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // An echo server: the tunnel's destination.
+    let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                while let Ok(n) = s.read(&mut buf).await {
+                    if n == 0 || s.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    let port = 45_000 + (std::process::id() % 2000) as u16;
+    let _relay = start_relay(port, &format!("127.0.0.1:{echo_port}"));
+    wait_listening(port).await;
+    let to = format!("127.0.0.1:{echo_port}");
+
+    let mut ws = open_tunnel(port, &to, Some(TOKEN)).await.expect("tunnel with the token");
+    ws.send(tokio_websockets::Message::binary(&b"bonjour"[..])).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("an answer")
+        .expect("a message")
+        .expect("no error");
+    assert_eq!(&*reply.into_payload(), b"bonjour");
+
+    assert!(open_tunnel(port, &to, None).await.is_err(), "no token, no tunnel");
+    assert!(open_tunnel(port, &to, Some("wrong")).await.is_err(), "wrong token, no tunnel");
+    assert!(
+        open_tunnel(port, "example.com:443", Some(TOKEN)).await.is_err(),
+        "only allowed destinations"
     );
 }

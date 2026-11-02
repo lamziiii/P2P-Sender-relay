@@ -26,6 +26,12 @@ pub enum PutError {
     Full,
 }
 
+/// A record in relay format signed by the key `z32`.
+pub fn verify(z32: &str, payload: &[u8]) -> bool {
+    PublicKey::from_z32(z32)
+        .is_ok_and(|key| SignedPacket::from_relay_payload(&key, payload).is_ok())
+}
+
 pub struct Store {
     records: Mutex<HashMap<PublicKey, (SignedPacket, Instant)>>,
     max_records: usize,
